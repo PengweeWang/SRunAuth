@@ -1,0 +1,40 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment / secrets
+.env
+.env.*
+*.local
+
+# Dependencies
+node_modules/
+vendor/
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+
+# Build / output
+dist/
+build/
+out/
+coverage/
+*.log
+*.cache
+
+# Package managers
+.npm/
+.pnpm-store/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Misc
+*.tmp
+*.bak
