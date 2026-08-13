@@ -40,7 +40,7 @@ python3 srun_auth.py watch --no-prompt --interval 30
 
 `watch` 在线时只查询状态，检测到离线后才重新认证。长期运行建议由
 systemd、OpenWrt procd 或其他服务管理器托管，并将凭据文件权限设为 `0600`。
-不要把密码直接写进脚本、命令行参数或提交到 Git。
+基于代码进行修改时不要把密码直接写进脚本、命令行参数或提交到 Git。
 
 ## 登录过程
 
