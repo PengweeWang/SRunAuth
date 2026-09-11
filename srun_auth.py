@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Authenticate against the SRun portal used by this campus network."""
+"""SRun campus network automatic authentication client."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import os
 import struct
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -21,6 +22,7 @@ from typing import Any
 
 
 DEFAULT_PORTAL = "http://10.20.69.103"
+DEFAULT_PROBE_URL = "http://www.baidu.com/"
 SRUN_BASE64_ALPHABET = (
     "LVoJPiCN2R8G90yg+hmFHuacZ1OWMnrsSTXkYpUq/3dlbfKwv6xztjI7DeBE45QA"
 )
@@ -31,6 +33,11 @@ STANDARD_BASE64_ALPHABET = (
 
 class SRunError(RuntimeError):
     """An expected portal or protocol error."""
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+        return None
 
 
 def _u32(value: int) -> int:
@@ -57,7 +64,7 @@ def _sencode(value: str, include_length: bool) -> list[int]:
 
 
 def xencode(value: str, key: str) -> bytes:
-    """Return the byte string produced by the portal's XXTEA-like encoder."""
+    """Return bytes encrypted using the portal's XXTEA-like algorithm."""
     if not value:
         return b""
 
@@ -93,6 +100,7 @@ def xencode(value: str, key: str) -> bytes:
 
 
 def encode_info(info: dict[str, Any], token: str) -> str:
+    """Encode authentication info using the portal's custom {SRBX1} format."""
     payload = json.dumps(info, ensure_ascii=False, separators=(",", ":"))
     encoded = base64.b64encode(xencode(payload, token)).decode("ascii")
     translation = str.maketrans(STANDARD_BASE64_ALPHABET, SRUN_BASE64_ALPHABET)
@@ -100,6 +108,7 @@ def encode_info(info: dict[str, Any], token: str) -> str:
 
 
 def parse_jsonp(payload: bytes) -> dict[str, Any]:
+    """Parse JSONP response from portal into a dictionary."""
     text = payload.decode("utf-8-sig").strip()
     if text.startswith("{"):
         value = json.loads(text)
@@ -107,30 +116,102 @@ def parse_jsonp(payload: bytes) -> dict[str, Any]:
         left = text.find("(")
         right = text.rfind(")")
         if left < 0 or right <= left:
-            raise SRunError(f"无法解析门户响应: {text[:200]}")
+            raise SRunError(f"Failed to parse portal response: {text[:200]}")
         value = json.loads(text[left + 1 : right])
     if not isinstance(value, dict):
-        raise SRunError("门户返回的不是 JSON 对象")
+        raise SRunError("Portal response is not a JSON object")
     return value
 
 
+PORTAL_MESSAGES: dict[str, str] = {
+    "login_ok": "Login successful",
+    "already_online": "Already online",
+    "online_after_no_response": "Online detected after retry",
+    "LogoutOK": "Logout successful",
+    "logout_ok": "Logout successful",
+    "not_online_error": "Not online",
+    "password_error": "Incorrect password",
+    "user_not_found": "Account not found",
+    "user_not_exist": "Account does not exist",
+    "user_is_not_exist": "Account does not exist",
+    "no_response_data_error": "Authentication gateway no response",
+    "RD000": "Authentication gateway no response (RD000)",
+    "portal_is_busy": "Portal is busy",
+    "ip_error": "IP address error",
+    "mac_error": "MAC address error",
+    "acid_error": "Access Controller (AC) ID error",
+    "user_name_error": "Username error",
+    "user_password_error": "Incorrect password",
+    "users_over": "Maximum online users limit reached",
+    "flow_over": "Data usage limit exceeded",
+    "fee_over": "Insufficient balance or overdue account",
+    "time_over": "Online duration limit exceeded",
+    "ip_limit": "IP binding restricted",
+    "mac_limit": "MAC binding restricted",
+    "auth_times_over": "Authentication attempts too frequent",
+}
+
+
 def response_message(response: dict[str, Any]) -> str:
+    """Extract message from portal response and convert known status codes to readable text."""
     for field in ("error_msg", "suc_msg", "error", "res", "message"):
         value = response.get(field)
         if value:
-            return str(value)
+            msg = str(value)
+            return PORTAL_MESSAGES.get(msg, msg)
     return json.dumps(response, ensure_ascii=False)
 
 
+def parse_access_context(redirect_url: str, portal: str) -> dict[str, str]:
+    """Parse network access parameters (ac_id, ip, mac, etc.) from gateway redirect URL."""
+    redirect = urllib.parse.urlsplit(redirect_url)
+    portal_url = urllib.parse.urlsplit(portal)
+    if redirect.hostname != portal_url.hostname:
+        return {}
+
+    query = {
+        key.lower(): values[0]
+        for key, values in urllib.parse.parse_qs(
+            redirect.query, keep_blank_values=False
+        ).items()
+        if values
+    }
+
+    def first(*names: str) -> str:
+        return next((query[name] for name in names if query.get(name)), "")
+
+    return {
+        "ac_id": first("ac_id", "acid"),
+        "ip": first("user_ip", "client_ip", "online_ip", "ip"),
+        "nas_ip": first("nas_ip", "ac_ip"),
+        "ap_id": first("ap_id"),
+        "ap_ip": first("ap_ip"),
+        "mac": first("user_mac", "client_mac", "mac"),
+    }
+
+
+def is_no_response_error(response: dict[str, Any]) -> bool:
+    """Check if the portal response indicates a gateway no-response error."""
+    values = (
+        response.get("error"),
+        response.get("error_msg"),
+        response.get("res"),
+        response.get("ecode"),
+        response.get("message"),
+    )
+    return any(value in {"no_response_data_error", "RD000"} for value in values)
+
+
 def parse_online_devices(response: dict[str, Any]) -> list[dict[str, str]]:
+    """Parse online device details returned by rad_user_info."""
     details = response.get("online_device_detail") or {}
     if isinstance(details, str):
         try:
             details = json.loads(details)
         except json.JSONDecodeError as exc:
-            raise SRunError(f"无法解析在线设备详情: {exc}") from exc
+            raise SRunError(f"Failed to parse online device details: {exc}") from exc
     if not isinstance(details, dict):
-        raise SRunError("门户返回的在线设备详情格式不正确")
+        raise SRunError("Invalid online device details format returned by portal")
 
     devices = []
     for record_id, value in details.items():
@@ -148,18 +229,161 @@ def parse_online_devices(response: dict[str, Any]) -> list[dict[str, str]]:
     return devices
 
 
+def format_add_time(timestamp: Any) -> str:
+    """Format Unix timestamp into yyyy-MM-dd HH:mm:ss string."""
+    if not timestamp:
+        return ""
+    try:
+        val = int(timestamp)
+        if 1000000000 <= val <= 2500000000:
+            return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(val))
+    except (ValueError, TypeError, OSError):
+        pass
+    return str(timestamp)
+
+
+def parse_device_manager_list(response: dict[str, Any]) -> list[dict[str, str]]:
+    """Parse online device list returned by /v1/auth/device/get."""
+    raw_list = response.get("data") or []
+    if not isinstance(raw_list, list):
+        return []
+    devices = []
+    for item in raw_list:
+        if not isinstance(item, dict):
+            continue
+        if item.get("is_online") is False:
+            continue
+        ip = str(item.get("ip") or item.get("online_ip") or item.get("user_ip") or "")
+        devices.append(
+            {
+                "id": str(item.get("rad_online_id") or ""),
+                "ip": ip,
+                "mac": str(item.get("user_mac") or ""),
+                "device": str(
+                    item.get("device_name")
+                    or item.get("device_type")
+                    or item.get("class_name")
+                    or ""
+                ),
+                "os": str(item.get("os_name") or ""),
+                "add_time": format_add_time(item.get("add_time")),
+                "raw_add_time": str(item.get("add_time") or "0"),
+            }
+        )
+    return devices
+
+
+def dm_sign(timestamp: str, username: str, ip: str, unbind: str = "1") -> str:
+    """Calculate SHA-1 signature for SRun DM logout request."""
+    source = f"{timestamp}{username}{ip}{unbind}{timestamp}"
+    return hashlib.sha1(source.encode("utf-8")).hexdigest()
+
+
+def is_dm_success(response: dict[str, Any]) -> bool:
+    """Check if rad_user_dm logout call was successful."""
+    values = (
+        response.get("error"),
+        response.get("res"),
+        response.get("error_msg"),
+        response.get("suc_msg"),
+        response.get("message"),
+    )
+    if any(val in {"ok", "LogoutOK"} for val in values):
+        return True
+    if response.get("code") == 0 and response.get("error") in {None, "", "ok"}:
+        return True
+    return False
+
+
+def is_overlimit_error(response: dict[str, Any]) -> bool:
+    """Check if the response indicates maximum online devices limit reached (E2620 / E3008)."""
+    code = str(response.get("ecode") or response.get("error") or "")
+    msg = str(
+        response.get("message")
+        or response.get("error_msg")
+        or response.get("res")
+        or ""
+    )
+    if code in {"E2620", "E3008"}:
+        return True
+    if msg.startswith("E2620") or msg.startswith("E3008"):
+        return True
+    if bool(response.get("overlimit_token")):
+        return True
+    overlimit_keywords = (
+        "maximum online devices reached",
+        "exceeded allowed online count",
+        "excessive connections",
+        "online users full",
+        "exceededonlinenumber",
+        "\u8d85\u51fa\u5141\u8bb8\u7684\u5728\u7ebf\u6570\u91cf",
+        "\u8fde\u7ebf\u6570\u8d85\u989d",
+        "\u5728\u7ebf\u8bbe\u5907\u6570\u91cf\u5df2\u8fbe\u4e0a\u9650",
+        "\u5728\u7ebf\u7528\u6237\u5df2\u6ee1",
+    )
+    msg_lower = msg.lower()
+    return any(k.lower() in msg_lower or k in msg for k in overlimit_keywords)
+
+
+def _display_width(text: str) -> int:
+    """Calculate display width of a string in terminal (handling wide characters)."""
+    return sum(2 if unicodedata.east_asian_width(c) in ("F", "W") else 1 for c in text)
+
+
+def _pad_string(text: str, width: int) -> str:
+    """Pad string to align with terminal display width."""
+    dw = _display_width(text)
+    return text + " " * max(0, width - dw)
+
+
+def _print_table(rows: list[list[str]], indent: str = "") -> None:
+    """Print aligned table columns (supporting mixed East Asian and Western text)."""
+    if not rows:
+        return
+    widths = [
+        max(_display_width(row[col]) for row in rows)
+        for col in range(len(rows[0]))
+    ]
+    for row in rows:
+        print(indent + "  ".join(_pad_string(val, widths[col]) for col, val in enumerate(row)).rstrip())
+
+
 @dataclass
 class SRunClient:
+    """SRun campus network authentication client."""
     portal: str = DEFAULT_PORTAL
     ac_id: str = "1"
     timeout: float = 8.0
     ip: str = ""
+    probe_url: str = DEFAULT_PROBE_URL
+    retries: int = 1
+    retry_delay: float = 3.0
+    verbose: bool = False
+    nas_ip: str = ""
+    ap_id: str = ""
+    ap_ip: str = ""
+    mac: str = ""
+    auto_kick: str = "none"
+    kick_ip: str = ""
+    interactive: bool = True
 
     def __post_init__(self) -> None:
         self.portal = self.portal.rstrip("/")
         parsed = urllib.parse.urlsplit(self.portal)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise SRunError(f"无效的门户地址: {self.portal}")
+            raise SRunError(f"Invalid portal URL: {self.portal}")
+        if self.retries < 0 or self.retries > 3:
+            raise SRunError("Authentication retries must be between 0 and 3")
+        if self.retry_delay < 0:
+            raise SRunError("Authentication retry delay cannot be negative")
+        valid_auto_kicks = {"none", "interactive", "oldest", "newest", "all"}
+        if self.auto_kick not in valid_auto_kicks:
+            raise SRunError(f"Invalid auto-kick policy: {self.auto_kick}")
+        self._fixed_ip = bool(self.ip)
+
+    def _log(self, message: str) -> None:
+        if self.verbose:
+            print(f"[srun] {message}", file=sys.stderr)
 
     def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
         query = urllib.parse.urlencode(
@@ -178,19 +402,70 @@ class SRunClient:
                 return parse_jsonp(response.read())
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:300]
-            raise SRunError(f"门户返回 HTTP {exc.code}: {detail}") from exc
+            raise SRunError(f"Portal returned HTTP {exc.code}: {detail}") from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise SRunError(f"无法连接门户 {self.portal}: {exc}") from exc
+            raise SRunError(f"Cannot connect to portal {self.portal}: {exc}") from exc
 
     def status(self) -> dict[str, Any]:
         return self._get(
             "/cgi-bin/rad_user_info",
-            {"callback": "_srun_cb", "ip": self.ip},
+            {"callback": "_srun_cb", "ip": self.ip if self._fixed_ip else ""},
         )
 
     @staticmethod
     def is_online(response: dict[str, Any]) -> bool:
         return response.get("error") == "ok" and bool(response.get("user_name"))
+
+    def refresh_access_context(self) -> dict[str, str]:
+        if not self.probe_url:
+            return {}
+
+        if not self._fixed_ip:
+            self.ip = ""
+        self.nas_ip = ""
+        self.ap_id = ""
+        self.ap_ip = ""
+        self.mac = ""
+
+        request = urllib.request.Request(
+            self.probe_url,
+            headers={"User-Agent": "Mozilla/5.0 srun-auth/1.1"},
+        )
+        opener = urllib.request.build_opener(_NoRedirect)
+        location = ""
+        try:
+            with opener.open(request, timeout=self.timeout) as response:
+                location = response.headers.get("Location", "")
+        except urllib.error.HTTPError as exc:
+            if 300 <= exc.code < 400:
+                location = exc.headers.get("Location", "")
+            else:
+                self._log(f"HTTP probe returned {exc.code}; continuing with portal-detected IP")
+                return {}
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            self._log(f"HTTP probe failed: {exc}; continuing with portal-detected IP")
+            return {}
+
+        if not location:
+            self._log("HTTP probe was not redirected by gateway")
+            return {}
+        location = urllib.parse.urljoin(self.probe_url, location)
+        context = parse_access_context(location, self.portal)
+        if not context:
+            self._log("HTTP probe redirected, but target is not the current SRun portal")
+            return {}
+
+        if context["ac_id"]:
+            self.ac_id = context["ac_id"]
+        if context["ip"] and not self._fixed_ip:
+            self.ip = context["ip"]
+        self.nas_ip = context["nas_ip"]
+        self.ap_id = context["ap_id"]
+        self.ap_ip = context["ap_ip"]
+        self.mac = context["mac"]
+        present = ", ".join(key for key, value in context.items() if value)
+        self._log(f"Refreshed access parameters from gateway redirect: {present or 'none'}")
+        return context
 
     def _challenge(self, username: str) -> tuple[str, str]:
         response = self._get(
@@ -198,10 +473,12 @@ class SRunClient:
             {"callback": "_srun_cb", "username": username, "ip": self.ip},
         )
         if response.get("error") != "ok" or not response.get("challenge"):
-            raise SRunError(f"获取 challenge 失败: {response_message(response)}")
+            raise SRunError(f"Failed to get challenge: {response_message(response)}")
         client_ip = self.ip or str(response.get("client_ip") or "")
         if not client_ip:
-            raise SRunError("challenge 响应中没有客户端 IP，请用 --ip 显式指定")
+            raise SRunError("No client IP in challenge response; please specify explicitly with --ip")
+        if not self._fixed_ip:
+            self.ip = client_ip
         return str(response["challenge"]), client_ip
 
     def _check_captcha(self, username: str, ip: str) -> None:
@@ -215,13 +492,9 @@ class SRunClient:
                 return
             raise
         if response.get("code") == 0 and str(response.get("data")) == "1":
-            raise SRunError("门户要求图片验证码，自动认证已停止；请先在网页中完成验证")
+            raise SRunError("Portal requires captcha image; automatic authentication stopped. Please verify in web browser first")
 
-    def login(self, username: str, password: str) -> dict[str, Any]:
-        current = self.status()
-        if self.is_online(current):
-            return {"error": "ok", "suc_msg": "already_online", **current}
-
+    def _login_once(self, username: str, password: str) -> dict[str, Any]:
         token, client_ip = self._challenge(username)
         self._check_captcha(username, client_ip)
 
@@ -253,7 +526,7 @@ class SRunClient:
                 "password": "{MD5}" + hmd5,
                 "os": "Linux",
                 "name": "Linux",
-                "nas_ip": "",
+                "nas_ip": self.nas_ip,
                 "double_stack": "0",
                 "chksum": checksum,
                 "info": info,
@@ -261,85 +534,481 @@ class SRunClient:
                 "ip": client_ip,
                 "n": "200",
                 "type": "1",
+                "ap_id": self.ap_id,
+                "ap_ip": self.ap_ip,
+                "mac": self.mac,
             },
         )
-        if response.get("error") != "ok":
-            raise SRunError(f"认证失败: {response_message(response)}")
-        self.ip = client_ip
         return response
+
+    def _portal_log(self, username: str) -> dict[str, Any] | None:
+        try:
+            return self._get("/v1/srun_portal_log", {"username": username})
+        except SRunError as exc:
+            self._log(f"Failed to query portal log: {exc}")
+            return None
+
+    def dm_logout(self, username: str, ip: str) -> dict[str, Any]:
+        """Send DM logout request to specified IP."""
+        if not username:
+            raise SRunError("Failed to logout device: Missing username")
+        if not ip:
+            raise SRunError("Failed to logout device: Missing target IP")
+
+        now = str(int(time.time()))
+        unbind = "1"
+        sign = dm_sign(now, username, ip, unbind)
+
+        response = self._get(
+            "/cgi-bin/rad_user_dm",
+            {
+                "callback": "_srun_cb",
+                "ip": ip,
+                "username": username,
+                "time": now,
+                "unbind": unbind,
+                "sign": sign,
+            },
+        )
+        if is_dm_success(response):
+            return response
+        raise SRunError(f"Failed to logout device {ip}: {response_message(response)}")
+
+    def get_online_devices(
+        self, username: str = "", overlimit_token: str = ""
+    ) -> list[dict[str, str]]:
+        """Get user online device list via /v1/auth/device/get or rad_user_info."""
+        if username:
+            try:
+                resp = self._get(
+                    "/v1/auth/device/get",
+                    {"user_name": username, "overlimit_token": overlimit_token},
+                )
+                if resp.get("code") == 0 and isinstance(resp.get("data"), list):
+                    devices = parse_device_manager_list(resp)
+                    if devices:
+                        return devices
+            except SRunError as exc:
+                self._log(f"Failed to get online devices via /v1/auth/device/get: {exc}")
+
+        # Fallback to online_device_detail from status() if available
+        try:
+            status = self.status()
+            if status.get("online_device_detail"):
+                raw_devices = parse_online_devices(status)
+                return [
+                    {
+                        "id": str(d.get("id") or ""),
+                        "ip": str(d.get("ipv4") or ""),
+                        "mac": "",
+                        "device": str(d.get("device") or ""),
+                        "os": str(d.get("os") or ""),
+                        "add_time": "",
+                        "raw_add_time": "0",
+                    }
+                    for d in raw_devices
+                    if d.get("ipv4")
+                ]
+        except SRunError as exc:
+            self._log(f"Failed to get online devices via rad_user_info: {exc}")
+        return []
+
+    def prompt_select_devices_to_kick(
+        self,
+        username: str,
+        devices: list[dict[str, str]],
+        response: dict[str, Any],
+    ) -> list[str]:
+        """Interactively display online devices and prompt user to select devices to kick/logout."""
+        print(f"\nAccount {username} online devices limit reached ({response_message(response)})")
+        print("Current online devices list:")
+        rows = [["#", "IP", "MAC", "Device/Type", "OS", "Login Time"]]
+        for idx, dev in enumerate(devices, 1):
+            rows.append(
+                [
+                    str(idx),
+                    dev.get("ip", "-"),
+                    dev.get("mac", "-") or "-",
+                    dev.get("device", "-") or "-",
+                    dev.get("os", "-") or "-",
+                    dev.get("add_time", "-") or "-",
+                ]
+            )
+        _print_table(rows, indent="  ")
+        print()
+
+        prompt_msg = (
+            f"Select device index to logout [1-{len(devices)}] "
+            "(enter 'all' to logout all, 'q' to cancel): "
+        )
+        while True:
+            choice = input(prompt_msg).strip()
+            if not choice or choice.lower() in {"q", "quit", "exit"}:
+                raise SRunError("Device logout cancelled")
+            if choice.lower() == "all":
+                return [d["ip"] for d in devices if d.get("ip")]
+            try:
+                idx = int(choice)
+                if 1 <= idx <= len(devices):
+                    target = devices[idx - 1].get("ip")
+                    if target:
+                        return [target]
+            except ValueError:
+                pass
+            print(f"Invalid input '{choice}'. Please enter a number between 1 and {len(devices)}, 'all', or 'q'")
+
+    def handle_overlimit(
+        self,
+        username: str,
+        response: dict[str, Any],
+        auto_kick: str = "none",
+        kick_ip: str = "",
+        interactive: bool = True,
+    ) -> bool:
+        """Handle online device limit exceeded (E2620) error by kicking other devices according to policy."""
+        token = str(response.get("overlimit_token") or "")
+        devices = self.get_online_devices(username=username, overlimit_token=token)
+
+        # Exclude current device's own IP if known
+        current_ip = getattr(self, "ip", "")
+        candidates = [d for d in devices if d.get("ip") and d.get("ip") != current_ip]
+        if not candidates:
+            candidates = [d for d in devices if d.get("ip")]
+
+        if not candidates:
+            raise SRunError(
+                f"Maximum online devices limit reached ({response_message(response)}), but unable to retrieve kickable device list."
+            )
+
+        target_ips: list[str] = []
+        if kick_ip:
+            target_ips = [kick_ip]
+        elif auto_kick == "oldest":
+            sorted_devs = sorted(
+                candidates,
+                key=lambda d: int(d.get("raw_add_time") or "0") or 9999999999,
+            )
+            oldest = sorted_devs[0]
+            target_ips = [oldest["ip"]]
+            desc = oldest.get("device") or oldest.get("os") or "Unknown Device"
+            print(f"Device limit exceeded. Automatically kicking oldest device: {oldest['ip']} ({desc})")
+        elif auto_kick == "newest":
+            sorted_devs = sorted(
+                candidates,
+                key=lambda d: int(d.get("raw_add_time") or "0"),
+                reverse=True,
+            )
+            newest = sorted_devs[0]
+            target_ips = [newest["ip"]]
+            desc = newest.get("device") or newest.get("os") or "Unknown Device"
+            print(f"Device limit exceeded. Automatically kicking newest device: {newest['ip']} ({desc})")
+        elif auto_kick == "all":
+            target_ips = [d["ip"] for d in candidates if d.get("ip")]
+            print(f"Device limit exceeded. Automatically kicking all {len(target_ips)} other devices")
+        elif interactive:
+            target_ips = self.prompt_select_devices_to_kick(username, candidates, response)
+        else:
+            dev_ips = ", ".join(d["ip"] for d in candidates)
+            raise SRunError(
+                f"Authentication failed: Maximum online devices limit reached ({response_message(response)}).\n"
+                f"Currently online devices: {dev_ips}.\n"
+                f"Hint: Use interactive terminal to select devices to kick, or use --auto-kick [oldest|newest|all]."
+            )
+
+        if not target_ips:
+            return False
+
+        for ip in target_ips:
+            self._log(f"Sending DM logout request: {ip}")
+            self.dm_logout(username=username, ip=ip)
+            print(f"Logged out device: {ip}")
+        return True
+
+    def login(
+        self,
+        username: str,
+        password: str,
+        auto_kick: str | None = None,
+        kick_ip: str | None = None,
+        interactive: bool | None = None,
+    ) -> dict[str, Any]:
+        """Perform authentication login, handling device overlimit by kicking devices and retrying."""
+        current = self.status()
+        if self.is_online(current):
+            return {"error": "ok", "suc_msg": "already_online", **current}
+
+        auto_kick = (
+            auto_kick
+            if auto_kick is not None
+            else getattr(self, "auto_kick", "none")
+        )
+        kick_ip = (
+            kick_ip if kick_ip is not None else getattr(self, "kick_ip", "")
+        )
+        if interactive is None:
+            interactive = getattr(self, "interactive", True)
+
+        last_response: dict[str, Any] = {}
+        portal_log = None
+        for attempt in range(self.retries + 1):
+            self.refresh_access_context()
+            last_response = self._login_once(username, password)
+            if last_response.get("error") == "ok":
+                return last_response
+
+            if is_overlimit_error(last_response):
+                self._log(f"Login returned device limit exceeded: {response_message(last_response)}")
+                if hasattr(self, "handle_overlimit"):
+                    kicked = self.handle_overlimit(
+                        username=username,
+                        response=last_response,
+                        auto_kick=auto_kick,
+                        kick_ip=kick_ip,
+                        interactive=interactive,
+                    )
+                    if kicked:
+                        time.sleep(1.5)
+                        last_response = self._login_once(username, password)
+                        if last_response.get("error") == "ok":
+                            return last_response
+                raise SRunError(f"Authentication failed: {response_message(last_response)}")
+
+            if not is_no_response_error(last_response):
+                raise SRunError(f"Authentication failed: {response_message(last_response)}")
+
+            portal_log = self._portal_log(username)
+            if portal_log and is_overlimit_error(portal_log):
+                self._log(f"Portal log indicates device limit exceeded: {response_message(portal_log)}")
+                if hasattr(self, "handle_overlimit"):
+                    kicked = self.handle_overlimit(
+                        username=username,
+                        response=portal_log,
+                        auto_kick=auto_kick,
+                        kick_ip=kick_ip,
+                        interactive=interactive,
+                    )
+                    if kicked:
+                        time.sleep(1.5)
+                        last_response = self._login_once(username, password)
+                        if last_response.get("error") == "ok":
+                            return last_response
+                raise SRunError(f"Authentication failed: {response_message(portal_log)}")
+
+            if attempt >= self.retries:
+                break
+            self._log(
+                f"Received {response_message(last_response)}, "
+                f"refreshing access parameters and retrying in {self.retry_delay:g}s"
+            )
+            time.sleep(self.retry_delay)
+            current = self.status()
+            if self.is_online(current):
+                return {
+                    "error": "ok",
+                    "suc_msg": "online_after_no_response",
+                    **current,
+                }
+
+        detail = response_message(last_response)
+        if portal_log:
+            log_message = response_message(portal_log)
+            if log_message != detail:
+                detail += f"; Portal log: {log_message}"
+        raise SRunError(f"Authentication failed: {detail}")
 
 
 def load_credentials(args: argparse.Namespace) -> tuple[str, str]:
+    """Read campus network username and password from CLI args, environment, or interactive input."""
     username = args.username or os.environ.get("SRUN_USERNAME", "")
     if not username:
-        username = input("校园网账号: ").strip()
+        username = input("Username: ").strip()
     password = os.environ.get("SRUN_PASSWORD", "")
     if not password and not args.no_prompt:
-        password = getpass.getpass("校园网密码: ")
+        password = getpass.getpass("Password: ")
     if not username or not password:
-        raise SRunError("缺少账号或密码；自动运行时请设置 SRUN_USERNAME/SRUN_PASSWORD")
+        raise SRunError("Missing username or password; set SRUN_USERNAME/SRUN_PASSWORD for automated runs")
     return username, password
 
 
 def print_status(client: SRunClient, response: dict[str, Any]) -> None:
+    """Print current authentication online or offline status."""
     if client.is_online(response):
-        ip = response.get("online_ip") or client.ip or "未知"
-        print(f"在线: {response.get('user_name')} ({ip})")
+        ip = response.get("online_ip") or client.ip or "Unknown"
+        print(f"Online: {response.get('user_name')} ({ip})")
     else:
-        print(f"离线: {response_message(response)}")
+        print(f"Offline: {response_message(response)}")
 
 
-def print_devices(client: SRunClient, response: dict[str, Any]) -> None:
-    if not client.is_online(response):
-        raise SRunError(f"当前 IP 未在线，无法查询所属账号的设备: {response_message(response)}")
+def print_devices(
+    client: SRunClient, response: dict[str, Any], username: str = ""
+) -> None:
+    """Display online devices list for specified account or current IP."""
+    if client.is_online(response):
+        user_name = response.get("user_name") or username
+        devices = parse_online_devices(response)
+        current_ip = str(response.get("online_ip") or client.ip or "")
+        reported_total = response.get("online_device_total", len(devices))
+        print(f"Account: {user_name}  Online devices: {reported_total}")
+        if not devices:
+            print("Portal did not return device details")
+            return
 
-    devices = parse_online_devices(response)
-    current_ip = str(response.get("online_ip") or client.ip or "")
-    reported_total = response.get("online_device_total", len(devices))
-    print(f"账号: {response.get('user_name')}  在线设备: {reported_total}")
-    if not devices:
-        print("门户没有返回设备详情")
+        rows = [["CURRENT", "ID", "IPv4", "IPv6", "Device/Type", "OS"]]
+        for device in devices:
+            rows.append(
+                [
+                    "*" if device["ipv4"] == current_ip else "",
+                    device["id"],
+                    device["ipv4"] or "-",
+                    device["ipv6"] or "-",
+                    device["device"] or "-",
+                    device["os"] or "-",
+                ]
+            )
+        _print_table(rows)
         return
 
-    rows = [["CURRENT", "ID", "IPV4", "IPV6", "DEVICE", "OS"]]
-    for device in devices:
-        rows.append(
-            [
-                "*" if device["ipv4"] == current_ip else "",
-                device["id"],
-                device["ipv4"] or "-",
-                device["ipv6"] or "-",
-                device["device"] or "-",
-                device["os"] or "-",
-            ]
-        )
-    widths = [max(len(row[index]) for row in rows) for index in range(len(rows[0]))]
-    for row in rows:
-        print("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)).rstrip())
+    if username:
+        devices_list = client.get_online_devices(username=username)
+        if not devices_list:
+            print(f"Account: {username}  No online devices found")
+            return
+        print(f"Account: {username}  Online devices: {len(devices_list)}")
+        rows = [["ID", "IP", "MAC", "Device/Type", "OS", "Login Time"]]
+        for d in devices_list:
+            rows.append(
+                [
+                    d.get("id", "-"),
+                    d.get("ip", "-"),
+                    d.get("mac", "-") or "-",
+                    d.get("device", "-") or "-",
+                    d.get("os", "-") or "-",
+                    d.get("add_time", "-") or "-",
+                ]
+            )
+        _print_table(rows)
+        return
+
+    raise SRunError(
+        f"Current IP is not online, unable to query account devices: {response_message(response)}; specify account with -u"
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="深澜 SRun 校园网自动认证")
+    """Build command-line argument parser."""
+    parser = argparse.ArgumentParser(description="SRun Campus Network Automatic Authentication")
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("status", "devices", "login", "watch"),
+        choices=("status", "devices", "login", "logout", "kick", "watch"),
         default="login",
+        help="Action to execute: status, devices, login, logout/kick, watch",
     )
-    parser.add_argument("-u", "--username", help="校园网账号，也可使用 SRUN_USERNAME")
-    parser.add_argument("--portal", default=os.environ.get("SRUN_PORTAL", DEFAULT_PORTAL))
-    parser.add_argument("--ac-id", default=os.environ.get("SRUN_AC_ID", "1"))
-    parser.add_argument("--ip", default=os.environ.get("SRUN_IP", ""), help="通常留空，由门户识别")
-    parser.add_argument("--timeout", type=float, default=8.0)
-    parser.add_argument("--interval", type=float, default=30.0, help="watch 检查间隔（秒）")
-    parser.add_argument("--no-prompt", action="store_true", help="禁止交互读取密码")
-    parser.add_argument("--json", action="store_true", help="原样输出门户 JSON 响应")
+    parser.add_argument("-u", "--username", help="Campus network username, or use env SRUN_USERNAME")
+    parser.add_argument(
+        "--portal",
+        default=os.environ.get("SRUN_PORTAL", DEFAULT_PORTAL),
+        help=f"SRun portal URL (default: {DEFAULT_PORTAL}, or use env SRUN_PORTAL)",
+    )
+    parser.add_argument(
+        "--ac-id",
+        default=os.environ.get("SRUN_AC_ID", "1"),
+        help="Access controller ID (ac_id) (default: 1, or use env SRUN_AC_ID)",
+    )
+    parser.add_argument(
+        "--ip",
+        default=os.environ.get("SRUN_IP", ""),
+        help="Local IP address, usually left empty for portal auto-detection (or use env SRUN_IP)",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=8.0,
+        help="HTTP request timeout in seconds (default: 8.0)",
+    )
+    parser.add_argument(
+        "--probe-url",
+        default=os.environ.get("SRUN_PROBE_URL", DEFAULT_PROBE_URL),
+        help=f"HTTP URL to trigger gateway redirect; pass empty string to disable (default: {DEFAULT_PROBE_URL}, or use env SRUN_PROBE_URL)",
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=1,
+        help="Retry count on no-response error (default: 1)",
+    )
+    parser.add_argument(
+        "--retry-delay",
+        type=float,
+        default=3.0,
+        help="Retry delay in seconds (default: 3.0)",
+    )
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=30.0,
+        help="Interval in seconds between watch checks (default: 30.0)",
+    )
+    parser.add_argument(
+        "--no-prompt",
+        action="store_true",
+        help="Disable interactive password prompt and interactive device kick selection",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output raw JSON response from portal",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Output access parameter refresh details and debug logs",
+    )
+    parser.add_argument(
+        "--auto-kick",
+        nargs="?",
+        const="oldest",
+        choices=("oldest", "newest", "all", "none", "interactive"),
+        default=None,
+        help="Automatic kick policy when device limit is exceeded (E2620): oldest, newest, all, none, interactive. Defaults to oldest if specified without value",
+    )
+    parser.add_argument(
+        "--kick-ip",
+        default="",
+        help="Target device IP to logout/kick",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Logout all online devices under the account when using logout/kick command",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Command-line main entry point."""
     args = build_parser().parse_args(argv)
-    client = SRunClient(args.portal, args.ac_id, args.timeout, args.ip)
+    auto_kick_arg = args.auto_kick
+    if auto_kick_arg is None:
+        if args.no_prompt or not sys.stdin.isatty():
+            auto_kick_arg = "none"
+        else:
+            auto_kick_arg = "interactive"
+
+    client = SRunClient(
+        portal=args.portal,
+        ac_id=args.ac_id,
+        timeout=args.timeout,
+        ip=args.ip,
+        probe_url=args.probe_url,
+        retries=args.retries,
+        retry_delay=args.retry_delay,
+        verbose=args.verbose,
+        auto_kick=auto_kick_arg,
+        kick_ip=args.kick_ip,
+        interactive=not args.no_prompt,
+    )
 
     if args.command in {"status", "devices"}:
         response = client.status()
@@ -348,24 +1017,102 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "status":
             print_status(client, response)
         else:
-            print_devices(client, response)
+            username = args.username or os.environ.get("SRUN_USERNAME", "")
+            print_devices(client, response, username=username)
         return 0
 
+    if args.command in {"logout", "kick"}:
+        current_status = client.status()
+        online = client.is_online(current_status)
+        current_ip = str(current_status.get("online_ip") or client.ip or "")
+        current_user = str(current_status.get("user_name") or "")
+
+        username = args.username or os.environ.get("SRUN_USERNAME", "") or current_user
+        if not username:
+            if not args.no_prompt and sys.stdin.isatty():
+                username = input("Username: ").strip()
+            if not username:
+                raise SRunError("Missing username; please specify account with -u/--username")
+
+        if args.all:
+            devices = client.get_online_devices(username=username)
+            if not devices:
+                print(f"No online devices found for account {username}")
+                return 0
+            print(f"Logging out all online devices for account {username} ({len(devices)} device(s)):")
+            for dev in devices:
+                ip = dev.get("ip")
+                if not ip:
+                    continue
+                try:
+                    client.dm_logout(username, ip)
+                    print(f"  Logged out: {ip} ({dev.get('os') or dev.get('device') or 'Unknown Device'})")
+                except SRunError as exc:
+                    print(f"  Failed to logout {ip}: {exc}", file=sys.stderr)
+            return 0
+
+        target_ip = args.ip or args.kick_ip
+        if target_ip:
+            client.dm_logout(username, target_ip)
+            print(f"Logout successful: Logged out device for {username} ({target_ip})")
+            return 0
+
+        if online and current_ip:
+            client.dm_logout(username, current_ip)
+            print(f"Logout successful: Logged out local device {username} ({current_ip})")
+            return 0
+
+        devices = client.get_online_devices(username=username)
+        if not devices:
+            print("Current device is offline, and no other online devices were found for this account")
+            return 0
+
+        if not args.no_prompt and sys.stdin.isatty():
+            target_ips = client.prompt_select_devices_to_kick(
+                username, devices, {"message": "Current device is offline, please select an online device to logout"}
+            )
+            for ip in target_ips:
+                client.dm_logout(username, ip)
+                print(f"Logout successful: Logged out device ({ip})")
+            return 0
+        else:
+            raise SRunError("Current device is not online; please specify device to logout using --ip <IP> or --all")
+
     username, password = load_credentials(args)
+    auto_kick = args.auto_kick
+    if auto_kick is None:
+        if args.no_prompt or not sys.stdin.isatty():
+            auto_kick = "none"
+        else:
+            auto_kick = "interactive"
+    interactive = (not args.no_prompt) and sys.stdin.isatty() and auto_kick == "interactive"
+
     if args.command == "login":
-        response = client.login(username, password)
-        print(f"认证成功: {response_message(response)}")
+        response = client.login(
+            username,
+            password,
+            auto_kick=auto_kick,
+            kick_ip=args.kick_ip,
+            interactive=interactive,
+        )
+        print(f"Authentication successful: {response_message(response)}")
         return 0
 
     if args.interval < 5:
-        raise SRunError("watch 的 --interval 不能小于 5 秒")
-    print(f"开始监测，每 {args.interval:g} 秒检查一次；按 Ctrl-C 退出")
+        raise SRunError("Watch --interval cannot be less than 5 seconds")
+    print(f"Started monitoring, checking every {args.interval:g}s; press Ctrl-C to stop")
     while True:
         try:
             status = client.status()
             if not client.is_online(status):
-                response = client.login(username, password)
-                print(f"[{time.strftime('%F %T')}] 认证成功: {response_message(response)}")
+                response = client.login(
+                    username,
+                    password,
+                    auto_kick=auto_kick,
+                    kick_ip=args.kick_ip,
+                    interactive=interactive,
+                )
+                print(f"[{time.strftime('%F %T')}] Authentication successful: {response_message(response)}")
         except SRunError as exc:
             print(f"[{time.strftime('%F %T')}] {exc}", file=sys.stderr)
         time.sleep(args.interval)
@@ -375,8 +1122,8 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except KeyboardInterrupt:
-        print("\n已停止")
+        print("\nStopped")
         raise SystemExit(130)
     except SRunError as exc:
-        print(f"错误: {exc}", file=sys.stderr)
+        print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1)
