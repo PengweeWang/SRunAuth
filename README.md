@@ -79,7 +79,7 @@ When maximum concurrent device limit is reached:
   ```
 - Log out a specific device by IP (e.g., remote kick your phone or another machine):
   ```sh
-  srunauth logout -u your_username --ip 10.126.13.54
+  srunauth logout -u your_username --ip 10.0.0.54
   ```
 - Log out all online devices under your account:
   ```sh

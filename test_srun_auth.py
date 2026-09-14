@@ -128,21 +128,21 @@ class ProtocolTests(unittest.TestCase):
 
     def test_parse_access_context_from_index_path_and_wlan_params(self):
         url = (
-            "http://10.20.69.103/index_4.html?wlanssid=NUDT-WLAN-SS&"
-            "wlanuserip=10.126.47.40&wlanusermac=D8:3A:DD:F1:DC:39&"
-            "redirect=http://auth-a186061.wifi.com/&wlanacip=0.0.0.0&"
-            "wlanacname=GFKD&wlan_tstamp=1789392543"
+            "http://10.20.69.103/index_4.html?wlanssid=CAMPUS-WLAN&"
+            "wlanuserip=10.10.10.40&wlanusermac=AA:BB:CC:DD:EE:FF&"
+            "redirect=http://example.com/&wlanacip=0.0.0.0&"
+            "wlanacname=AC-GW-01&wlan_tstamp=1789392543"
         )
         context = parse_access_context(url, "http://10.20.69.103")
         self.assertEqual(
             context,
             {
                 "ac_id": "4",
-                "ip": "10.126.47.40",
+                "ip": "10.10.10.40",
                 "nas_ip": "",
                 "ap_id": "",
                 "ap_ip": "",
-                "mac": "D8:3A:DD:F1:DC:39",
+                "mac": "AA:BB:CC:DD:EE:FF",
             },
         )
 
