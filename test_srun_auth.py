@@ -1,7 +1,7 @@
 import hashlib
 import io
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 
 from srun_auth import (
     SRunError,
@@ -107,6 +107,44 @@ class ProtocolTests(unittest.TestCase):
             ),
             {},
         )
+
+    def test_parse_access_context_with_aliases_and_fragment(self):
+        context = parse_access_context(
+            "http://10.20.69.103/#/login?ac=3&wlanuserip=192.168.1.100&"
+            "wlanacname=bras-01&usermac=11-22-33-44-55-66",
+            "http://10.20.69.103",
+        )
+        self.assertEqual(
+            context,
+            {
+                "ac_id": "3",
+                "ip": "192.168.1.100",
+                "nas_ip": "bras-01",
+                "ap_id": "",
+                "ap_ip": "",
+                "mac": "11-22-33-44-55-66",
+            },
+        )
+
+    def test_refresh_access_context_verbose_logs(self):
+        from unittest.mock import MagicMock, patch
+
+        client = SRunClient(portal="http://10.20.69.103", verbose=True)
+        mock_response = MagicMock()
+        mock_response.headers.get.return_value = "http://10.20.69.103/index.html?user_ip=10.0.0.99&ac_id=5"
+        mock_opener = MagicMock()
+        mock_opener.open.return_value.__enter__.return_value = mock_response
+
+        stderr_buf = io.StringIO()
+        with patch("urllib.request.build_opener", return_value=mock_opener):
+            with redirect_stderr(stderr_buf):
+                ctx = client.refresh_access_context()
+
+        output = stderr_buf.getvalue()
+        self.assertIn("HTTP probe redirected to: http://10.20.69.103/index.html?user_ip=10.0.0.99&ac_id=5", output)
+        self.assertIn("Refreshed access parameters from gateway redirect: ac_id=5, ip=10.0.0.99", output)
+        self.assertEqual(client.ip, "10.0.0.99")
+        self.assertEqual(client.ac_id, "5")
 
     def test_no_response_detection(self):
         self.assertTrue(is_no_response_error({"error_msg": "no_response_data_error"}))

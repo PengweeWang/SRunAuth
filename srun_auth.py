@@ -169,10 +169,14 @@ def parse_access_context(redirect_url: str, portal: str) -> dict[str, str]:
     if redirect.hostname != portal_url.hostname:
         return {}
 
+    query_str = redirect.query
+    if not query_str and "?" in redirect.fragment:
+        query_str = redirect.fragment.split("?", 1)[1]
+
     query = {
         key.lower(): values[0]
         for key, values in urllib.parse.parse_qs(
-            redirect.query, keep_blank_values=False
+            query_str, keep_blank_values=False
         ).items()
         if values
     }
@@ -181,12 +185,12 @@ def parse_access_context(redirect_url: str, portal: str) -> dict[str, str]:
         return next((query[name] for name in names if query.get(name)), "")
 
     return {
-        "ac_id": first("ac_id", "acid"),
-        "ip": first("user_ip", "client_ip", "online_ip", "ip"),
-        "nas_ip": first("nas_ip", "ac_ip"),
-        "ap_id": first("ap_id"),
-        "ap_ip": first("ap_ip"),
-        "mac": first("user_mac", "client_mac", "mac"),
+        "ac_id": first("ac_id", "acid", "ac"),
+        "ip": first("user_ip", "client_ip", "online_ip", "ip", "wlanuserip", "userip", "user-ip"),
+        "nas_ip": first("nas_ip", "ac_ip", "nasip", "acip", "wlanacname", "wlan_ac_name"),
+        "ap_id": first("ap_id", "apid"),
+        "ap_ip": first("ap_ip", "apip"),
+        "mac": first("user_mac", "client_mac", "mac", "usermac", "wlanusermac", "user-mac"),
     }
 
 
@@ -390,6 +394,21 @@ class SRunClient:
             {key: value for key, value in params.items() if value is not None}
         )
         url = f"{self.portal}{path}?{query}"
+        if self.verbose:
+            debug_params = {}
+            for k, v in params.items():
+                if v is None:
+                    continue
+                if k == "password":
+                    debug_params[k] = "{MD5}***" if str(v).startswith("{MD5}") else "***"
+                elif k == "info" and isinstance(v, str) and len(v) > 30:
+                    debug_params[k] = f"{v[:16]}...({len(v)} chars)"
+                elif k == "chksum" and isinstance(v, str) and len(v) > 16:
+                    debug_params[k] = f"{v[:8]}..."
+                else:
+                    debug_params[k] = v
+            self._log(f"HTTP GET {path} with params: {debug_params}")
+
         request = urllib.request.Request(
             url,
             headers={
@@ -399,11 +418,16 @@ class SRunClient:
         )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                return parse_jsonp(response.read())
+                result = parse_jsonp(response.read())
+                if self.verbose:
+                    self._log(f"HTTP response from {path}: {result}")
+                return result
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:300]
+            self._log(f"HTTP error from {path}: HTTP {exc.code} - {detail}")
             raise SRunError(f"Portal returned HTTP {exc.code}: {detail}") from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            self._log(f"Network error requesting {path}: {exc}")
             raise SRunError(f"Cannot connect to portal {self.portal}: {exc}") from exc
 
     def status(self) -> dict[str, Any]:
@@ -427,6 +451,7 @@ class SRunClient:
         self.ap_ip = ""
         self.mac = ""
 
+        self._log(f"Probing network gateway redirect via {self.probe_url}")
         request = urllib.request.Request(
             self.probe_url,
             headers={"User-Agent": "Mozilla/5.0 srun-auth/1.1"},
@@ -436,20 +461,34 @@ class SRunClient:
         try:
             with opener.open(request, timeout=self.timeout) as response:
                 location = response.headers.get("Location", "")
+                if not location:
+                    self._log(f"HTTP probe returned HTTP {response.status} without redirect header")
         except urllib.error.HTTPError as exc:
             if 300 <= exc.code < 400:
                 location = exc.headers.get("Location", "")
             else:
-                self._log(f"HTTP probe returned {exc.code}; continuing with portal-detected IP")
+                self._log(f"HTTP probe returned HTTP {exc.code}; continuing with portal-detected IP")
                 return {}
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             self._log(f"HTTP probe failed: {exc}; continuing with portal-detected IP")
             return {}
 
         if not location:
-            self._log("HTTP probe was not redirected by gateway")
+            self._log(f"HTTP probe was not redirected by gateway (target: {self.probe_url})")
             return {}
         location = urllib.parse.urljoin(self.probe_url, location)
+        self._log(f"HTTP probe redirected to: {location}")
+
+        target_host = urllib.parse.urlsplit(location).hostname
+        configured_host = urllib.parse.urlsplit(self.portal).hostname
+        if target_host != configured_host:
+            self._log(
+                f"HTTP probe redirected to {location}, but target hostname '{target_host}' "
+                f"does not match configured portal '{configured_host}' "
+                f"(hint: check if --portal should be set to http://{target_host})"
+            )
+            return {}
+
         context = parse_access_context(location, self.portal)
         if not context:
             self._log("HTTP probe redirected, but target is not the current SRun portal")
@@ -463,8 +502,15 @@ class SRunClient:
         self.ap_id = context["ap_id"]
         self.ap_ip = context["ap_ip"]
         self.mac = context["mac"]
-        present = ", ".join(key for key, value in context.items() if value)
-        self._log(f"Refreshed access parameters from gateway redirect: {present or 'none'}")
+
+        present_items = [f"{key}={value}" for key, value in context.items() if value]
+        if present_items:
+            self._log(f"Refreshed access parameters from gateway redirect: {', '.join(present_items)}")
+        else:
+            raw_query = urllib.parse.urlsplit(location).query
+            if not raw_query and "?" in urllib.parse.urlsplit(location).fragment:
+                raw_query = urllib.parse.urlsplit(location).fragment.split("?", 1)[1]
+            self._log(f"Refreshed access parameters from gateway redirect: none (query: '{raw_query or 'none'}')")
         return context
 
     def _challenge(self, username: str) -> tuple[str, str]:
@@ -479,6 +525,7 @@ class SRunClient:
             raise SRunError("No client IP in challenge response; please specify explicitly with --ip")
         if not self._fixed_ip:
             self.ip = client_ip
+        self._log(f"Challenge acquired: token={response['challenge'][:8]}..., client_ip={client_ip}")
         return str(response["challenge"]), client_ip
 
     def _check_captcha(self, username: str, ip: str) -> None:
@@ -543,7 +590,10 @@ class SRunClient:
 
     def _portal_log(self, username: str) -> dict[str, Any] | None:
         try:
-            return self._get("/v1/srun_portal_log", {"username": username})
+            log_resp = self._get("/v1/srun_portal_log", {"username": username})
+            if log_resp:
+                self._log(f"Portal log query result: {log_resp}")
+            return log_resp
         except SRunError as exc:
             self._log(f"Failed to query portal log: {exc}")
             return None
@@ -751,9 +801,15 @@ class SRunClient:
         last_response: dict[str, Any] = {}
         portal_log = None
         for attempt in range(self.retries + 1):
+            if attempt > 0:
+                self._log(f"Starting login attempt {attempt + 1}/{self.retries + 1}...")
             self.refresh_access_context()
+            target_ip = getattr(self, "ip", "") or "auto"
+            target_acid = getattr(self, "ac_id", "1")
+            self._log(f"Attempting login for user '{username}' (IP: {target_ip}, ac_id: {target_acid})")
             last_response = self._login_once(username, password)
             if last_response.get("error") == "ok":
+                self._log(f"Login successful: {response_message(last_response)}")
                 return last_response
 
             if is_overlimit_error(last_response):
