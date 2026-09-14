@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "srunauth"
+version = "1.1.0"
+description = "SRun campus network automatic authentication client"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [
+    { name = "Pengwee Wang", email = "ssnape@qq.com" }
+]
+keywords = ["srun", "campus-network", "authentication", "portal", "login"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Internet",
+    "Topic :: Utilities",
+]
+dependencies = []
+
+[project.scripts]
+srunauth = "srun_auth.cli:cli_entry"
+srun-auth = "srun_auth.cli:cli_entry"
+
+[project.urls]
+Homepage = "https://github.com/PengweeWang/SRunAuth"
+Repository = "https://github.com/PengweeWang/SRunAuth.git"
+Issues = "https://github.com/PengweeWang/SRunAuth/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["srun_auth*", "srunauth*"]
