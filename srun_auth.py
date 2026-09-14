@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import struct
 import sys
 import time
@@ -184,10 +185,22 @@ def parse_access_context(redirect_url: str, portal: str) -> dict[str, str]:
     def first(*names: str) -> str:
         return next((query[name] for name in names if query.get(name)), "")
 
+    ac_id = first("ac_id", "acid", "ac")
+    if not ac_id and redirect.path:
+        path_match = re.search(
+            r"(?:index|srun_portal(?:_pc)?)_(\d+)\.html?", redirect.path, re.IGNORECASE
+        )
+        if path_match:
+            ac_id = path_match.group(1)
+
+    nas_ip = first("nas_ip", "ac_ip", "nasip", "acip", "wlanacip")
+    if nas_ip == "0.0.0.0":
+        nas_ip = ""
+
     return {
-        "ac_id": first("ac_id", "acid", "ac"),
+        "ac_id": ac_id,
         "ip": first("user_ip", "client_ip", "online_ip", "ip", "wlanuserip", "userip", "user-ip"),
-        "nas_ip": first("nas_ip", "ac_ip", "nasip", "acip", "wlanacname", "wlan_ac_name"),
+        "nas_ip": nas_ip,
         "ap_id": first("ap_id", "apid"),
         "ap_ip": first("ap_ip", "apip"),
         "mac": first("user_mac", "client_mac", "mac", "usermac", "wlanusermac", "user-mac"),

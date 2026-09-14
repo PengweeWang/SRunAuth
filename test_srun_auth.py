@@ -111,7 +111,7 @@ class ProtocolTests(unittest.TestCase):
     def test_parse_access_context_with_aliases_and_fragment(self):
         context = parse_access_context(
             "http://10.20.69.103/#/login?ac=3&wlanuserip=192.168.1.100&"
-            "wlanacname=bras-01&usermac=11-22-33-44-55-66",
+            "acip=10.9.8.7&usermac=11-22-33-44-55-66",
             "http://10.20.69.103",
         )
         self.assertEqual(
@@ -119,10 +119,30 @@ class ProtocolTests(unittest.TestCase):
             {
                 "ac_id": "3",
                 "ip": "192.168.1.100",
-                "nas_ip": "bras-01",
+                "nas_ip": "10.9.8.7",
                 "ap_id": "",
                 "ap_ip": "",
                 "mac": "11-22-33-44-55-66",
+            },
+        )
+
+    def test_parse_access_context_from_index_path_and_wlan_params(self):
+        url = (
+            "http://10.20.69.103/index_4.html?wlanssid=NUDT-WLAN-SS&"
+            "wlanuserip=10.126.47.40&wlanusermac=D8:3A:DD:F1:DC:39&"
+            "redirect=http://auth-a186061.wifi.com/&wlanacip=0.0.0.0&"
+            "wlanacname=GFKD&wlan_tstamp=1789392543"
+        )
+        context = parse_access_context(url, "http://10.20.69.103")
+        self.assertEqual(
+            context,
+            {
+                "ac_id": "4",
+                "ip": "10.126.47.40",
+                "nas_ip": "",
+                "ap_id": "",
+                "ap_ip": "",
+                "mac": "D8:3A:DD:F1:DC:39",
             },
         )
 
