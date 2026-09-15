@@ -18,18 +18,79 @@ from .client import (
     parse_online_devices,
     response_message,
 )
+from .config import (
+    delete_config,
+    get_default_config_path,
+    load_config,
+    save_config,
+)
 
-def load_credentials(args: argparse.Namespace) -> tuple[str, str]:
-    """Read campus network username and password from CLI args, environment, or interactive input."""
-    username = args.username or os.environ.get("SRUN_USERNAME", "")
-    if not username:
+
+class CredentialsResult(tuple):
+    """Container for username and password with origin metadata, backwards-compatible with 2-tuple."""
+
+    username: str
+    password: str
+    is_interactive: bool
+    from_config: bool
+
+    def __new__(
+        cls,
+        username: str,
+        password: str,
+        is_interactive: bool = False,
+        from_config: bool = False,
+    ):
+        return super().__new__(cls, (username, password))
+
+    def __init__(
+        self,
+        username: str,
+        password: str,
+        is_interactive: bool = False,
+        from_config: bool = False,
+    ):
+        self.username = username
+        self.password = password
+        self.is_interactive = is_interactive
+        self.from_config = from_config
+
+
+def load_credentials(args: argparse.Namespace) -> CredentialsResult:
+    """Read campus network username and password from CLI args, environment, saved config, or interactive input."""
+    config_path = getattr(args, "config_path", None)
+    cfg = load_config(config_path)
+
+    username = getattr(args, "username", None) or os.environ.get("SRUN_USERNAME", "")
+    if not username and cfg.get("username"):
+        username = cfg["username"]
+
+    password = getattr(args, "password", None) or os.environ.get("SRUN_PASSWORD", "")
+    from_config = False
+    if not password:
+        if cfg.get("has_password"):
+            cli_or_env_user = getattr(args, "username", None) or os.environ.get("SRUN_USERNAME", "")
+            if not cli_or_env_user or cli_or_env_user == cfg.get("username"):
+                password = cfg["password"]
+                from_config = True
+        elif cfg.get("password_error") and getattr(args, "verbose", False):
+            print(f"Warning: Failed to decrypt saved credentials: {cfg['password_error']}", file=sys.stderr)
+
+    typed_interactive = False
+    no_prompt = getattr(args, "no_prompt", False)
+
+    if not username and not no_prompt and sys.stdin.isatty():
         username = input("Username: ").strip()
-    password = os.environ.get("SRUN_PASSWORD", "")
-    if not password and not args.no_prompt:
+        typed_interactive = True
+
+    if not password and not no_prompt and sys.stdin.isatty():
         password = getpass.getpass("Password: ")
+        typed_interactive = True
+
     if not username or not password:
-        raise SRunError("Missing username or password; set SRUN_USERNAME/SRUN_PASSWORD for automated runs")
-    return username, password
+        raise SRunError("Missing username or password; set SRUN_USERNAME/SRUN_PASSWORD, use 'srunauth config --save', or pass -u/-p")
+
+    return CredentialsResult(username, password, is_interactive=typed_interactive, from_config=from_config)
 
 
 def print_status(client: SRunClient, response: dict[str, Any]) -> None:
@@ -102,20 +163,48 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("status", "devices", "login", "logout", "kick", "watch"),
+        choices=("status", "devices", "login", "logout", "kick", "watch", "config"),
         default="login",
-        help="Action to execute: status, devices, login, logout/kick, watch",
+        help="Action to execute: status, devices, login, logout/kick, watch, config",
     )
-    parser.add_argument("-u", "--username", help="Campus network username, or use env SRUN_USERNAME")
+    parser.add_argument("-u", "--username", help="Campus network username, or use env SRUN_USERNAME / saved config")
+    parser.add_argument(
+        "-p",
+        "--password",
+        default=None,
+        help="Campus network password, or use env SRUN_PASSWORD (prefer saved config for security)",
+    )
     parser.add_argument(
         "--portal",
-        default=os.environ.get("SRUN_PORTAL", DEFAULT_PORTAL),
-        help=f"SRun portal URL (default: {DEFAULT_PORTAL}, or use env SRUN_PORTAL)",
+        default=None,
+        help=f"SRun portal URL (default: {DEFAULT_PORTAL}, or use env SRUN_PORTAL / saved config)",
     )
     parser.add_argument(
         "--ac-id",
-        default=os.environ.get("SRUN_AC_ID", "1"),
-        help="Access controller ID (ac_id) (default: 1, or use env SRUN_AC_ID)",
+        default=None,
+        help="Access controller ID (ac_id) (default: 1, or use env SRUN_AC_ID / saved config)",
+    )
+    parser.add_argument(
+        "--config-path",
+        default=None,
+        help="Path to configuration file (default: ~/.config/srunauth/config.json or env SRUN_CONFIG)",
+    )
+    parser.add_argument(
+        "--save",
+        action="store_true",
+        help="Save/update credentials and settings to local encrypted config file",
+    )
+    parser.add_argument(
+        "--no-save",
+        action="store_true",
+        help="Do not save credentials to config file and do not prompt to save",
+    )
+    parser.add_argument(
+        "--clear-config",
+        "--clear",
+        dest="clear_config",
+        action="store_true",
+        help="Delete the stored local configuration file",
     )
     parser.add_argument(
         "--ip",
@@ -188,9 +277,81 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def handle_config_command(args: argparse.Namespace, cfg: dict[str, Any]) -> int:
+    """Handle 'srunauth config' subcommand to view or save configuration."""
+    cfg_path = args.config_path or get_default_config_path()
+
+    if args.save:
+        username = args.username or os.environ.get("SRUN_USERNAME") or cfg.get("username", "")
+        if not username:
+            if sys.stdin.isatty() and not args.no_prompt:
+                username = input("Username: ").strip()
+            if not username:
+                raise SRunError("Missing username to save in config")
+
+        password = getattr(args, "password", None) or os.environ.get("SRUN_PASSWORD")
+        if not password:
+            if sys.stdin.isatty() and not args.no_prompt:
+                password = getpass.getpass("Password: ")
+            elif cfg.get("has_password") and username == cfg.get("username"):
+                password = cfg["password"]
+            else:
+                raise SRunError("Missing password to save in config")
+
+        portal = args.portal or os.environ.get("SRUN_PORTAL") or cfg.get("portal") or DEFAULT_PORTAL
+        ac_id = args.ac_id or os.environ.get("SRUN_AC_ID") or cfg.get("ac_id") or "1"
+
+        saved_path = save_config(
+            username=username,
+            password=password,
+            portal=portal,
+            ac_id=ac_id,
+            config_path=args.config_path,
+        )
+        print(f"Configuration saved to {saved_path} (password encrypted with machine key)")
+        return 0
+
+    print(f"Configuration file: {cfg_path}")
+    if not cfg:
+        print("Status: Not configured")
+        print("Tip: Run 'srunauth config --save' or 'srunauth login' to save credentials.")
+        return 0
+
+    print("Status: Configured")
+    print(f"Username: {cfg.get('username') or '(not set)'}")
+    if cfg.get("has_password"):
+        print("Password: [Stored & Encrypted with machine key]")
+    elif cfg.get("password_error"):
+        print(f"Password: [Decryption Error: {cfg['password_error']}]")
+    else:
+        print("Password: (not set)")
+    print(f"Portal: {cfg.get('portal') or DEFAULT_PORTAL}")
+    print(f"AC ID: {cfg.get('ac_id') or '1'}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Command-line main entry point."""
     args = build_parser().parse_args(argv)
+    config_path = args.config_path
+    cfg = load_config(config_path)
+
+    if args.clear_config:
+        deleted = delete_config(config_path)
+        target_path = config_path or get_default_config_path()
+        if deleted:
+            print(f"Configuration file deleted: {target_path}")
+        else:
+            print(f"No configuration file found at: {target_path}")
+        if args.command == "config":
+            return 0
+
+    if args.command == "config":
+        return handle_config_command(args, cfg)
+
+    portal = args.portal or os.environ.get("SRUN_PORTAL") or cfg.get("portal") or DEFAULT_PORTAL
+    ac_id = args.ac_id or os.environ.get("SRUN_AC_ID") or cfg.get("ac_id") or "1"
+
     auto_kick_arg = args.auto_kick
     if auto_kick_arg is None:
         if args.no_prompt or not sys.stdin.isatty():
@@ -199,8 +360,8 @@ def main(argv: list[str] | None = None) -> int:
             auto_kick_arg = "interactive"
 
     client = SRunClient(
-        portal=args.portal,
-        ac_id=args.ac_id,
+        portal=portal,
+        ac_id=ac_id,
         timeout=args.timeout,
         ip=args.ip,
         probe_url=args.probe_url,
@@ -219,7 +380,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "status":
             print_status(client, response)
         else:
-            username = args.username or os.environ.get("SRUN_USERNAME", "")
+            username = args.username or os.environ.get("SRUN_USERNAME", "") or cfg.get("username", "")
             print_devices(client, response, username=username)
         return 0
 
@@ -229,7 +390,7 @@ def main(argv: list[str] | None = None) -> int:
         current_ip = str(current_status.get("online_ip") or client.ip or "")
         current_user = str(current_status.get("user_name") or "")
 
-        username = args.username or os.environ.get("SRUN_USERNAME", "") or current_user
+        username = args.username or os.environ.get("SRUN_USERNAME", "") or current_user or cfg.get("username", "")
         if not username:
             if not args.no_prompt and sys.stdin.isatty():
                 username = input("Username: ").strip()
@@ -280,7 +441,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             raise SRunError("Current device is not online; please specify device to logout using --ip <IP> or --all")
 
-    username, password = load_credentials(args)
+    creds = load_credentials(args)
+    username, password = creds.username, creds.password
     auto_kick = args.auto_kick
     if auto_kick is None:
         if args.no_prompt or not sys.stdin.isatty():
@@ -298,6 +460,35 @@ def main(argv: list[str] | None = None) -> int:
             interactive=interactive,
         )
         print(f"Authentication successful: {response_message(response)}")
+
+        if args.save:
+            saved_path = save_config(
+                username=username,
+                password=password,
+                portal=portal,
+                ac_id=ac_id,
+                config_path=args.config_path,
+            )
+            print(f"Configuration saved to {saved_path} (password encrypted with machine key)")
+        elif (
+            creds.is_interactive
+            and not args.no_save
+            and sys.stdin.isatty()
+            and not args.no_prompt
+        ):
+            try:
+                prompt_save = input("Save credentials for future logins? [Y/n]: ").strip().lower()
+                if prompt_save in ("", "y", "yes"):
+                    saved_path = save_config(
+                        username=username,
+                        password=password,
+                        portal=portal,
+                        ac_id=ac_id,
+                        config_path=args.config_path,
+                    )
+                    print(f"Saved credentials to {saved_path} (password encrypted with machine key)")
+            except (EOFError, KeyboardInterrupt):
+                pass
         return 0
 
     if args.interval < 5:

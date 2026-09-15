@@ -55,9 +55,55 @@ Interactive login (password will be masked):
 srunauth login -u your_username -v
 ```
 
+After successful authentication in an interactive terminal, `srunauth` prompts whether to save your credentials. Once saved, future logins will authenticate automatically without re-entering your username or password:
+
+```sh
+# Future logins require no arguments:
+srunauth login
+```
+
+You can also explicitly save credentials or skip saving:
+
+```sh
+# Force save/update credentials to configuration file
+srunauth login -u your_username --save
+
+# Disable credential saving and suppress prompt
+srunauth login -u your_username --no-save
+```
+
 Before authenticating, the client probes `http://www.baidu.com/` to capture gateway redirection and automatically refreshes `ac_id` (including automatic extraction from redirect paths such as `/index_4.html`), `nas_ip`, `ap_id`, `ap_ip`, client IP, and MAC address.
 
 If a `no_response_data_error` or `RD000` occurs, the client waits 3 seconds, checks current online status, refreshes parameters, and retries. Retries can be disabled using `--retries 0`, or gateway probing can be disabled with `--probe-url ''`.
+
+### Configuration and Encrypted Credential Storage
+
+`srunauth` supports storing credentials and portal settings in a local configuration file (`~/.config/srunauth/config.json`, or customized via `$SRUN_CONFIG` / `--config-path`).
+
+**Security Design**:
+- **No Plaintext Passwords**: Passwords are never written to disk in plaintext.
+- **Machine & User Bound**: Credentials are encrypted using `PBKDF2-HMAC-SHA256-CTR` authenticated encryption with 100,000 PBKDF2 iterations. The encryption key is cryptographically tied to the local machine identity (`/etc/machine-id`) and user ID (`UID`). Even if the configuration file is copied to another device or user account, it cannot be decrypted.
+- **Strict POSIX Permissions**: The configuration directory is created with `0700` (`rwx------`) and the configuration file with `0600` (`rw-------`), blocking access from other users on the system.
+- **Zero Third-Party Dependencies**: The encryption is implemented entirely with Python standard library modules (`hashlib`, `hmac`, `secrets`, `struct`).
+
+> **Why machine-bound encryption instead of a static hash?**
+> The SRun 4K portal protocol generates a dynamic, random challenge token on every login. Both `hmd5 = HMAC_MD5(token, password)` and `info = xencode({"password": password, ...}, token)` dynamically depend on this random token, and the backend server decrypts `info` to verify against RADIUS/LDAP. Therefore, a static password hash (e.g. SHA-256) cannot be used by the protocol. Machine-bound authenticated local encryption securely solves credential reuse without exposing plaintext passwords.
+
+**Manage Configuration**:
+
+- Check configuration status (passwords are always masked):
+  ```sh
+  srunauth config
+  ```
+- Manually save or update credentials without logging in:
+  ```sh
+  srunauth config --save -u your_username
+  ```
+- Remove stored configuration:
+  ```sh
+  srunauth config --clear
+  # Or: srunauth --clear-config
+  ```
 
 ### Device Limit Exceeded (E2620) Handling
 
@@ -88,7 +134,13 @@ When maximum concurrent device limit is reached:
 
 ### Daemon / Unattended Monitoring
 
-Keep the connection alive continuously in the background:
+Keep the connection alive continuously in the background. With saved credentials, no environment variables or arguments are needed:
+
+```sh
+srunauth watch --auto-kick oldest --interval 30
+```
+
+Or configure via environment variables if preferred:
 
 ```sh
 export SRUN_USERNAME='your_username'
@@ -98,7 +150,7 @@ srunauth watch --no-prompt --auto-kick oldest --interval 30
 
 `watch` periodically checks connection status, and only re-authenticates when offline is detected. If a device limit is exceeded upon reconnecting, `--auto-kick oldest` automatically logs out the oldest device to restore access.
 
-For 24/7 background operation, it is recommended to manage the process via systemd, OpenWrt procd, or a supervisor daemon, with credentials protected (`chmod 0600`). Avoid committing passwords to Git or embedding them into cleartext scripts.
+For 24/7 background operation, it is recommended to manage the process via systemd, OpenWrt procd, or a supervisor daemon. With `srunauth config --save`, your credentials remain securely encrypted with `0600` permissions.
 
 ## Python API Usage
 

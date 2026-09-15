@@ -1,7 +1,7 @@
 """SRun campus network automatic authentication package."""
 from __future__ import annotations
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 from .client import (
     DEFAULT_PORTAL,
@@ -31,9 +31,21 @@ from .client import (
     response_message,
     xencode,
 )
+from .config import (
+    CONFIG_VERSION,
+    delete_config,
+    decrypt_secret,
+    encrypt_secret,
+    get_default_config_path,
+    get_machine_identity,
+    load_config,
+    save_config,
+)
 from .cli import (
+    CredentialsResult,
     build_parser,
     cli_entry,
+    handle_config_command,
     load_credentials,
     main,
     print_devices,
@@ -67,8 +79,18 @@ __all__ = [
     "parse_online_devices",
     "response_message",
     "xencode",
+    "CONFIG_VERSION",
+    "delete_config",
+    "decrypt_secret",
+    "encrypt_secret",
+    "get_default_config_path",
+    "get_machine_identity",
+    "load_config",
+    "save_config",
+    "CredentialsResult",
     "build_parser",
     "cli_entry",
+    "handle_config_command",
     "load_credentials",
     "main",
     "print_devices",
